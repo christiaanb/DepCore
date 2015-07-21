@@ -51,9 +51,11 @@ check env (Let n p s) c = do
 
 check env (Split t s) c =
   do sigmab <- infer' env t
-     undefined
-     -- case sigmab of
-     --   VBind (Sigma v) f -> do
+     case sigmab of
+       VBind (Sigma v) f -> do
+         t' <- eval env t
+         undefined
+       _ -> throwError ("Split: expected Sigma type, but found: " ++ show t)
 
 
 -- * Inferring
@@ -83,7 +85,12 @@ infer env (Let n p s) = do
   t <- infer env' (fromScope s)
   return (Let n p (toScope t))
 
-infer env (App t u) = error "infer App: undefined"
+infer env (App t u) = do
+  piab <- infer' env t
+  case piab of
+    VBind (Pi v) f -> do
+      undefined
+    _ -> throwError ("App: expected Pi type, but found: " ++ show t)
 
 infer _ Type = pure Type
 
