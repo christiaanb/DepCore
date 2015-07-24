@@ -8,6 +8,7 @@
 import Bound
 import Bound.Name
 import Bound.Scope
+import Bound.Var
 import Control.Comonad
 import Control.Monad
 import Control.Monad.Except
@@ -298,6 +299,13 @@ instance Equal Value where
   eq env (VLam v s0)  (VLam _ s1)  = do
     let env' = extendEnvQ env (extract v)
     eq env' (fromScope s0) (fromScope s1)
+  eq env (VSigma t0 s0)  (VSigma t1 s1)  = do
+    eq env (extract t0) (extract t1)
+    let env' = extendEnvQ env (extract t0)
+    eq env' (fromScope s0) (fromScope s1)
+  eq env (VPair u0 t0) (VPair u1 t1) = do
+    eq env u0 u1
+    eq env t0 t1
   eq _ v0 v1 | v0 == v1  = return ()
              | otherwise = throwError ("eq: Different values:" ++ show (v0,v1) )
 
@@ -315,6 +323,11 @@ instance Equal Neutral where
   eq env (NApp t0 u0) (NApp t1 u1) = do
     eq env t0 t1
     eq env u0 u1
+  eq env (NSplit t0 _ u0) (NSplit t1 _ u1) = do
+    eq env t0 t1
+    let env' = Env (unvar (\n -> error (show (name n) ++ " undefined")) (fmap F . ctx env))
+                   (unvar (Id . B) (fmap F . def env))
+    eq env' (fromScope u0) (fromScope u1)
   eq _ _ _ = throwError "eq: Different Neutrals"
 
 let_ :: Eq a => [(a,Type a a,Type a a)] -> Term a a -> Term a a
