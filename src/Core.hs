@@ -95,6 +95,7 @@ data Value m n
   = Neutral (Neutral m n)
   | VType
   | VBind (Binder n (Value m n)) (Value m n -> m (Value m n))
+  | VTmp Int
 
 data Neutral m n
   = NVar n

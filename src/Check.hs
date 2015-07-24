@@ -54,6 +54,7 @@ check env (Split t s) c =
      case sigmab of
        VBind (Sigma v) f -> do
          t' <- eval env t
+         -- b' <-
          undefined
        _ -> throwError ("Split: expected Sigma type, but found: " ++ show t)
 
@@ -89,7 +90,10 @@ infer env (App t u) = do
   piab <- infer' env t
   case piab of
     VBind (Pi v) f -> do
+      v' <- quote _ (extract v)
+      -- check env u v'
       undefined
+
     _ -> throwError ("App: expected Pi type, but found: " ++ show t)
 
 infer _ Type = pure Type
