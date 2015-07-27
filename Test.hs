@@ -19,8 +19,15 @@ import Data.String
 -- import Data.Functor.Invariant
 import Prelude.Extras
 
+import Debug.Trace
+
 newtype Eval a = Eval { runEval :: (Except String a) }
   deriving (Functor, Applicative, Monad, MonadError String)
+
+doEval t = case runExcept $ runEval t of
+             Left s  -> putStrLn s
+             Right a -> print a
+
 
 data Term n a
   = Var !a
@@ -40,7 +47,7 @@ data Term n a
   | Force (Term n a)
   | Rec (Term n a)
   | Fold (Term n a)
-  | Unfold (Term n a) (Scope (Name n ()) (Term n) a)
+  | Unfold (Name n (Term n a)) (Scope (Name n ()) (Term n) a)
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 data Tup = Fst | Snd
@@ -82,7 +89,7 @@ bindTerm (Box t) f      = Box (bindTerm t f)
 bindTerm (Force t) f    = Force (bindTerm t f)
 bindTerm (Rec t) f      = Rec (bindTerm t f)
 bindTerm (Fold t) f     = Fold (bindTerm t f)
-bindTerm (Unfold t s) f = Unfold (bindTerm t f) (s >>>= f)
+bindTerm (Unfold t s) f = Unfold (fmap (`bindTerm` f) t) (s >>>= f)
 
 bindProg :: Prog n a -> (a -> Term n b) -> Prog n b
 bindProg ps f = map (fmap (bimap (>>>= f) (>>>= f))) ps
@@ -114,7 +121,7 @@ data Neutral n a
   | NSplit (Neutral n a) (n,n) (Scope (Name n Tup) (Term n) a)
   | NCase (Neutral n a) [(n,Term n a)]
   | NForce (Neutral n a)
-  | NUnfold (Neutral n a) (Scope (Name n ()) (Term n) a)
+  | NUnfold (Name n (Neutral n a)) (Scope (Name n ()) (Term n) a)
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 instance Eq n => Eq1 (Value n)
@@ -135,8 +142,9 @@ data EnvEntry f a
 type EnvEntry' n = EnvEntry (Term n)
 type Env' n      = Env (Term n) (EnvEntry' n)
 
-emptyEnv :: Env f g a
-emptyEnv = Env (error "aap") (error "noot")
+-- emptyEnv :: Env f g a
+emptyEnv = Env (\x -> error ("No declaration for: " ++ show x))
+               (\x -> error ("No definition for: " ++ show x))
 
 infer :: (Eq a, Eq n, Show n, Show a)
       => Env (Term n) (EnvEntry' n) a
@@ -242,6 +250,22 @@ extendEnvCase env i l = env {def = def'}
     def' a | a == i    = Cloj (Label l)
            | otherwise = def env a
 
+extendEnvUnfold :: Eq a
+                => Env' n a
+                -> Type n a
+                -> n
+                -> Maybe a
+                -> Env' n (Var (Name n ()) a)
+extendEnvUnfold (Env ctxOld defOld) tyA tName tM = Env ctx' def'
+  where
+    ctx' (B _)   = F <$> Force tyA
+    ctx' (F tm') = F <$> ctxOld tm'
+
+    def' b@(B _) = Id b
+    def' (F tm')
+      | Just tm'  == tM = Cloj (Fold (Var (B (Name tName ()))))
+      | otherwise       = F <$> defOld tm'
+
 checkProg :: (Eq a, Eq n, Show n, Show a)
           => Env' n a -> Prog n a
           -> Eval (Env' n (Var (Name n Int) a))
@@ -286,11 +310,25 @@ check env (Case t as) c = do
             else do
               t' <- eval env t
               case t' of
-                (Neutral (NVar i)) ->
+                Neutral (NVar i) ->
                   mapM_ (\(l,u) -> let env' = extendEnvCase env i l
                                    in  check env' u c) as
                 _ -> mapM_ (\(_,u) -> check env u c) as
     _ -> throwError "check: Case: expected Enum"
+
+check env (Unfold t s) c = do
+  vrec <- infer' env (extract t)
+  case vrec of
+    VRec a -> do
+      t' <- eval env (extract t)
+      let tM = case t' of
+                 Neutral (NVar i) -> Just i
+                 _ -> Nothing
+          env' = extendEnvUnfold env a (name t) tM
+      check env' (fromScope s) (F <$> c)
+    _ -> throwError "check: Unfold: expected Rec"
+
+check env (Force t) c = check env t (Lift c)
 
 check env t a = check' env t =<< eval env a
 
@@ -304,10 +342,15 @@ check' env (Pair l r) (VSigma ty s) = do
   check env l (extract ty)
   let s' = instantiate1Name l s
   check env r s'
+check' _ (Pair _ _) v = throwError ("check': expected sigma: " ++ show v)
 check' _ (Label l) (VEnum ls) | l `elem` ls = return ()
 check' _ (Label _) _ = throwError "check': Label"
+check' env (Box t) (VLift a) = check env t a
+check' env (Fold t) (VRec a) = check' env t =<< eval env (Force a)
 check' env t a       = do b <- infer' env t
-                          eq env a b
+                          t' <- infer env t
+                          catchError (eq env a b)
+                                     (\s -> throwError (s ++ "\nt: " ++ show t' ++ "\na: " ++ show a))
 
 eval :: (MonadError String m, Eq n)
      => Env' n a -> Term n a -> m (Value n a)
@@ -337,7 +380,7 @@ eval _   (Box t)     = return (VBox (Boxed t))
 eval env (Force t)   = force env =<< eval env t
 eval _   (Rec t)     = return (VRec t)
 eval _   (Fold t)    = return (VFold t)
-eval env (Unfold t s) = flip (unfold env) s =<< eval env t
+eval env (Unfold t s) = flip (unfold env (name t)) s =<< eval env (extract t)
 
 evalApp :: (MonadError String m, Eq n)
         => Env' n a -> Value n a -> Term n a -> m (Value n a)
@@ -377,12 +420,13 @@ force _   _                = throwError "force: Box expected"
 
 unfold :: (MonadError String m, Eq n)
        => Env' n a
+       -> n
        -> Value n a
        -> Scope (Name n ()) (Term n) a
        -> m (Value n a)
-unfold env (VFold c)   b = eval env (instantiate1Name c b)
-unfold _   (Neutral n) b = return (Neutral (NUnfold n b))
-unfold _   _           _ = throwError "unfold: Fold expected"
+unfold env _ (VFold c)    b = eval env (instantiate1Name c b)
+unfold _   n (Neutral n') b = return (Neutral (NUnfold (Name n n') b))
+unfold _   _ _            _ = throwError "unfold: Fold expected"
 
 defs :: Prog n a -> Int -> Scope (Name n Int) (Term n) a
 defs ps i = snd . extract $ (ps!!i)
@@ -417,7 +461,9 @@ instance Equal Value where
   eq env (VRec u0) (VRec u1) = eq env u0 u1
   eq env (VFold u0) (VFold u1) = eq env u0 u1
   eq _ v0 v1 | v0 == v1  = return ()
-             | otherwise = throwError ("eq: Different values:" ++ show (v0,v1) )
+             | otherwise = throwError ("eq: Different values:" ++
+                                       "\nv0: " ++ show v0 ++
+                                       "\nv1: " ++ show v1)
 
 instance Equal Neutral where
   eq _ (NVar i0) (NVar i1)
@@ -447,7 +493,7 @@ instance Equal Neutral where
     eqBranches as0 as1
   eq env (NForce t0) (NForce t1) = eq env t0 t1
   eq env (NUnfold t0 u0) (NUnfold t1 u1) = do
-    eq env t0 t1
+    eq env (extract t0) (extract t1)
     let env' = Env (unvar (\n -> error ("eq Neutral: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
                (unvar (Id . B) (fmap F . def env))
     eq env' (fromScope u0) (fromScope u1)
@@ -509,7 +555,7 @@ eqBox env (Force t0) (Force t1) = eqBox env t0 t1
 eqBox env (Rec t0) (Rec t1) = eqBox env t0 t1
 eqBox env (Fold t0) (Fold t1) = eqBox env t0 t1
 eqBox env (Unfold t0 u0) (Unfold t1 u1) = do
-  eqBox env t0 t1
+  eqBox env (extract t0) (extract t1)
   let env' = Env (unvar (\n -> error ("eqBox Unfold: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
                  (unvar (Id . B) (fmap F . def env))
   eq env' (Boxed (fromScope u0)) (Boxed (fromScope u1))
@@ -541,6 +587,9 @@ app f args = foldl App f args
 
 split :: Eq a => Term a a -> (a,a) -> Term a a -> Term a a
 split t (x,y) u = Split t (x,y) (abstractName (\z -> if z == x then Just Fst else if z == y then Just Snd else Nothing) u)
+
+unfold_ t v u = Unfold (Name v t) (abstract1Name v u)
+unfold' t     = unfold_ t "x_unfold" "x_unfold"
 
 (->-) :: Term String String -> Term String String -> Term String String
 (->-) t = pi_ ("",t)
@@ -596,19 +645,64 @@ nat   = bool ++
          )
         ,("zero"
          ,"Nat"
-         ,Pair (Label "z") (Label "unit")
-         )
-        ,("succ"
+         ,Pair (Label "z") (Label "unit"))
+        ,("suc"
          ,"Nat" ->- "Nat"
-         ,lam' "n" "Nat" (Pair (Label "s") (Fold "n"))
+         ,lam' "n" "Nat" $ Pair (Label "s") (Fold "n")
          )
-        ,("one"
-         ,"Nat"
-         ,App "succ" "zero"
+        ,("eqNat"
+         ,"Nat" ->- "Nat" ->- "Bool"
+         ,lam' "m" "Nat" $
+          lam' "n" "Nat" $
+          split "m" ("lm","m'") $
+          split "n" ("ln","n'") $
+          Force (Case "lm" [("z",Case "ln" [("z",Box $ Label "true")
+                                           ,("s",Box $ Label "false")])
+                           ,("s",Case "ln" [("z",Box $ Label "false")
+                                           ,("s",Box $ app "eqNat" [unfold' "m'",unfold' "n'"])
+                                           ])
+                           ])
          )
-        ,("two"
-         ,"Nat"
-         ,App "succ" "one")
+        ,("EqNat"
+         ,"Nat" ->- "Nat" ->- Type
+         ,lam' "m" "Nat" $ lam' "n" "Nat" $ App "T" (app "eqNat" ["m","n"])
+         )
+        ,("reflNat"
+         ,pi_ ("n","Nat") (app "EqNat" ["n","n"])
+         ,lam' "n" "Nat" $ split "n" ("nl","n'") $
+            Force (Case "nl" [("z",Box (Label "unit"))
+                             ,("s",Box (App "reflNat" (unfold' "n'")))
+                             ])
+         )
         ]
 
-test1 = let_ nat "two"
+fin   = nat ++
+        [("Fin"
+         ,"Nat" ->- Type
+         ,lam' "n" "Nat" $ sigma ("l",Enum ["z","s"]) $
+            Case "l" [("z",sigma ("n'","Nat") (app "EqNat" [App "suc" "n'","n"]))
+                     ,("s",sigma ("n'","Nat") (Rec (Box (App "Fin" "n'")) -*- app "EqNat" [App "suc" "n'","n"]))
+                     ]
+         )
+        ]
+
+vec   = fin ++
+        [("Vec"
+         ,"Nat" ->- Type ->- Type
+         ,lam' "n" "Nat" $ lam' "A" Type $ sigma ("l",Enum ["nil","cons"]) $
+            Case "l" [("nil",app "EqNat" ["zero","n"] )
+                     ,("cons",sigma ("n'","Nat") ("A" -*- Rec (Box (app "Vec" ["n'","A"])) -*- app "EqNat" [App "suc" "n'","n"]))
+                     ]
+         )
+        ,("nil"
+         ,pi_ ("A",Type) $ app "Vec" ["zero","A"]
+         ,lam' "A" Type $ Pair (Label "nil") (App "reflNat" "zero")
+         )
+        ,("cons"
+         ,pi_ ("n","Nat") $ pi_ ("A",Type) $ "A" ->- app "Vec" ["n","A"] ->- app "Vec" [App "suc" "n","A"]
+         ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
+            Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
+         )
+        ]
+
+test1 = let_ vec "cons"
