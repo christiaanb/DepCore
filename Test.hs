@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable, KindSignatures,
              NoMonomorphismRestriction, TupleSections, OverloadedStrings,
              ScopedTypeVariables, FlexibleContexts, GeneralizedNewtypeDeriving,
-             Rank2Types, GADTs, LambdaCase, ViewPatterns #-}
+             Rank2Types, GADTs, LambdaCase, ViewPatterns, OverloadedStrings #-}
 {-# OPTIONS_GHC -Wall #-}
 
 
@@ -12,8 +12,10 @@ import Bound.Var
 import Control.Comonad
 import Control.Monad
 import Control.Monad.Except
+import Control.Monad.Trans.Maybe
 import Data.Bifunctor
 import Data.List
+import Data.String
 -- import Data.Functor.Invariant
 import Prelude.Extras
 
@@ -32,6 +34,13 @@ data Term n a
   | Split (Term n a) (n,n) (Scope (Name n Tup) (Term n) a)
   | Enum [n]
   | Label n
+  | Case (Term n a) [(n,Term n a)]
+  | Lift (Term n a)
+  | Box (Term n a)
+  | Force (Term n a)
+  | Rec (Term n a)
+  | Fold (Term n a)
+  | Unfold (Term n a) (Scope (Name n ()) (Term n) a)
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 data Tup = Fst | Snd
@@ -64,12 +73,22 @@ bindTerm (Let n p s) f  = Let n (bindProg p f) (s >>>= f)
 bindTerm (App e u) f    = App (bindTerm e f) (bindTerm u f)
 bindTerm (Sigma tm s) f = Sigma (fmap (`bindTerm` f) tm) (s >>>= f)
 bindTerm (Pair l r) f   = Pair (bindTerm l f) (bindTerm r f)
-bindTerm (Split t xy s) f  = Split (bindTerm t f) xy (s >>>= f)
+bindTerm (Split t xy s) f = Split (bindTerm t f) xy (s >>>= f)
 bindTerm (Enum ls) _    = Enum ls
 bindTerm (Label l) _    = Label l
+bindTerm (Case t as) f  = Case (bindTerm t f) (map (second (`bindTerm` f)) as)
+bindTerm (Lift t) f     = Lift (bindTerm t f)
+bindTerm (Box t) f      = Box (bindTerm t f)
+bindTerm (Force t) f    = Force (bindTerm t f)
+bindTerm (Rec t) f      = Rec (bindTerm t f)
+bindTerm (Fold t) f     = Fold (bindTerm t f)
+bindTerm (Unfold t s) f = Unfold (bindTerm t f) (s >>>= f)
 
 bindProg :: Prog n a -> (a -> Term n b) -> Prog n b
 bindProg ps f = map (fmap (bimap (>>>= f) (>>>= f))) ps
+
+instance IsString a => IsString (Term n a) where
+  fromString = Var . fromString
 
 data Value n a
   = Neutral (Neutral n a)
@@ -80,12 +99,22 @@ data Value n a
   | VPair  (Term n a) (Term n a)
   | VEnum [n]
   | VLabel n
+  | VLift  (Type n a)
+  | VBox   (Boxed n a)
+  | VRec   (Type n a)
+  | VFold  (Term n a)
+  deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
+
+newtype Boxed n a = Boxed { unBoxed :: Term n a }
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 data Neutral n a
   = NVar a
   | NApp (Neutral n a) (Term n a)
   | NSplit (Neutral n a) (n,n) (Scope (Name n Tup) (Term n) a)
+  | NCase (Neutral n a) [(n,Term n a)]
+  | NForce (Neutral n a)
+  | NUnfold (Neutral n a) (Scope (Name n ()) (Term n) a)
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 instance Eq n => Eq1 (Value n)
@@ -142,8 +171,22 @@ infer env (Sigma tm s) = do
 infer _ (Enum ls) = if nub ls /= ls
                        then throwError "infer: duplicate lables"
                        else return Type
+infer env (Box t) = Lift <$> infer env t
+infer env (Fold t) = Rec . Box <$> infer env t
+infer env (Force t) = do
+  a <- infer' env t
+  case a of
+    VLift b -> return b
+    _       -> throwError "infer: expected Lifted type"
+infer env (Lift a) = check env a Type >> return Type
+infer env (Rec a) = check env a (Lift Type) >> return Type
+
 infer _ (Lam _ _) = throwError "infer: cannot infer un-annotated Lambda"
-infer _ tm        = throwError $ "infer: cannot infer type for: " ++ show tm
+infer _ (Pair _ _) = throwError "infer: cannot infer un-annotated Pair"
+infer _ (Split _ _ _) = throwError "infer: cannot infer un-annotated Split"
+infer _ (Label _) = throwError "infer: cannot infer un-annotated Label"
+infer _ (Case _ _) = throwError "infer: cannot infer un-annotated Case"
+infer _ (Unfold _ _) = throwError "infer: cannot infer un-annotated Unfold"
 
 infer' :: (Eq a, Eq n, Show n, Show a)
        => Env' n a
@@ -190,6 +233,15 @@ extendEnvSplit (Env ctxOld defOld) tyA tyB x y mA = Env ctx' def'
       | Just tm' == mA = Cloj $ Pair (Var (B (Name x Fst))) (Var (B (Name y Snd)))
       | otherwise      = F <$> defOld tm'
 
+extendEnvCase :: Eq a
+              => Env' n a
+              -> a -> n
+              -> Env' n a
+extendEnvCase env i l = env {def = def'}
+  where
+    def' a | a == i    = Cloj (Label l)
+           | otherwise = def env a
+
 checkProg :: (Eq a, Eq n, Show n, Show a)
           => Env' n a -> Prog n a
           -> Eval (Env' n (Var (Name n Int) a))
@@ -206,7 +258,8 @@ checkProg' env (ty,tm) = do
   check env ty Type
   check env tm ty
 
-check :: (Eq a, Eq n, Show n, Show a) => Env' n a -> Term n a -> Term n a -> Eval ()
+check :: (Eq a, Eq n, Show n, Show a)
+      => Env' n a -> Term n a -> Term n a -> Eval ()
 check env (Let _ p s) c = do
   env' <- checkProg env p
   check env' (fromScope s) (F <$> c)
@@ -221,7 +274,23 @@ check env (Split t (x,y) u) c = do
                    _ -> Nothing
           env' = extendEnvSplit env (extract tyA) tyB x y tM
       check env' (fromScope u) (F <$> c)
-    _ -> throwError "check: expected sigma"
+    _ -> throwError "check: Split: expected sigma"
+
+check env (Case t as) c = do
+  enum <- infer' env t
+  case enum of
+    VEnum ls ->
+      let ls' = map fst as
+      in  if ls /= ls'
+            then throwError "check: Labels don't match"
+            else do
+              t' <- eval env t
+              case t' of
+                (Neutral (NVar i)) ->
+                  mapM_ (\(l,u) -> let env' = extendEnvCase env i l
+                                   in  check env' u c) as
+                _ -> mapM_ (\(_,u) -> check env u c) as
+    _ -> throwError "check: Case: expected Enum"
 
 check env t a = check' env t =<< eval env a
 
@@ -240,7 +309,8 @@ check' _ (Label _) _ = throwError "check': Label"
 check' env t a       = do b <- infer' env t
                           eq env a b
 
-eval :: MonadError String m => Env' n a -> Term n a -> m (Value n a)
+eval :: (MonadError String m, Eq n)
+     => Env' n a -> Term n a -> m (Value n a)
 eval env (Var x)     = case def env x of
                          Cloj tm -> eval env tm
                          Id v    -> return (Neutral (NVar v))
@@ -261,13 +331,21 @@ eval _   (Pair l r)  = return (VPair l r)
 eval env (Split t xy s) = flip (evalSplit env xy) s =<< eval env t
 eval _   (Enum ls)   = return (VEnum ls)
 eval _   (Label l)   = return (VLabel l)
+eval env (Case t as) = flip (evalCase env) as =<< eval env t
+eval _   (Lift t)    = return (VLift t)
+eval _   (Box t)     = return (VBox (Boxed t))
+eval env (Force t)   = force env =<< eval env t
+eval _   (Rec t)     = return (VRec t)
+eval _   (Fold t)    = return (VFold t)
+eval env (Unfold t s) = flip (unfold env) s =<< eval env t
 
-evalApp :: MonadError String m => Env' n a -> Value n a -> Term n a -> m (Value n a)
+evalApp :: (MonadError String m, Eq n)
+        => Env' n a -> Value n a -> Term n a -> m (Value n a)
 evalApp env (VLam _ s) u  = eval env (instantiate1Name u s)
 evalApp _   (Neutral t) u = return (Neutral (NApp t u))
 evalApp _   _ _           = throwError ("evalApp: function expected")
 
-evalSplit :: MonadError String m
+evalSplit :: (MonadError String m, Eq n)
           => Env' n a
           -> (n,n)
           -> Value n a
@@ -277,6 +355,34 @@ evalSplit env _ (VPair l r) s = do
   eval env (instantiateName (\case {Fst -> l;Snd -> r}) s)
 evalSplit _ xy (Neutral n) s = return (Neutral (NSplit n xy s))
 evalSplit _ _ _ _ = throwError "evalSplit: Pair expected"
+
+evalCase :: (MonadError String m, Eq n)
+         => Env' n a
+         -> Value n a
+         -> [(n,Term n a)]
+         -> m (Value n a)
+evalCase env (VLabel l) as = case lookup l as of
+  Just t  -> eval env t
+  Nothing -> throwError "evalCase: case not matched"
+evalCase _ (Neutral n) as = return (Neutral (NCase n as))
+evalCase _ _ _ = throwError "evalCase: Label expected"
+
+force :: (MonadError String m, Eq n)
+      => Env' n a
+      -> Value n a
+      -> m (Value n a)
+force env (VBox (Boxed c)) = eval env c
+force _   (Neutral n)      = return (Neutral (NForce n))
+force _   _                = throwError "force: Box expected"
+
+unfold :: (MonadError String m, Eq n)
+       => Env' n a
+       -> Value n a
+       -> Scope (Name n ()) (Term n) a
+       -> m (Value n a)
+unfold env (VFold c)   b = eval env (instantiate1Name c b)
+unfold _   (Neutral n) b = return (Neutral (NUnfold n b))
+unfold _   _           _ = throwError "unfold: Fold expected"
 
 defs :: Prog n a -> Int -> Scope (Name n Int) (Term n) a
 defs ps i = snd . extract $ (ps!!i)
@@ -292,20 +398,24 @@ instance Equal Term where
 
 instance Equal Value where
   eq env (Neutral n1) (Neutral n2) = eq env n1 n2
-  eq env (VPi t0 s0)  (VPi t1 s1)  = do
+  eq env (VPi t0 s0)  (VPi t1 s1) = do
     eq env (extract t0) (extract t1)
     let env' = extendEnvQ env (extract t0)
     eq env' (fromScope s0) (fromScope s1)
   eq env (VLam v s0)  (VLam _ s1)  = do
     let env' = extendEnvQ env (extract v)
     eq env' (fromScope s0) (fromScope s1)
-  eq env (VSigma t0 s0)  (VSigma t1 s1)  = do
+  eq env (VSigma t0 s0)  (VSigma t1 s1) = do
     eq env (extract t0) (extract t1)
     let env' = extendEnvQ env (extract t0)
     eq env' (fromScope s0) (fromScope s1)
-  eq env (VPair u0 t0) (VPair u1 t1) = do
-    eq env u0 u1
+  eq env (VPair u0 t0) (VPair u1 t1) =
+    eq env u0 u1 >>
     eq env t0 t1
+  eq env (VLift u0) (VLift u1) = eq env u0 u1
+  eq env (VBox u0) (VBox u1) = eq env u0 u1
+  eq env (VRec u0) (VRec u1) = eq env u0 u1
+  eq env (VFold u0) (VFold u1) = eq env u0 u1
   eq _ v0 v1 | v0 == v1  = return ()
              | otherwise = throwError ("eq: Different values:" ++ show (v0,v1) )
 
@@ -320,15 +430,91 @@ instance Equal Neutral where
     --       (Id j0, Id j1) -> unless (j0 == j1) (throwError "eq: Different variables")
     --       (Cloj t0, Cloj t1) -> eq env t0 t1
     --       _ -> throwError "eq: Variable vs Neutral"
-  eq env (NApp t0 u0) (NApp t1 u1) = do
-    eq env t0 t1
+  eq env (NApp t0 u0) (NApp t1 u1) =
+    eq env t0 t1 >>
     eq env u0 u1
   eq env (NSplit t0 _ u0) (NSplit t1 _ u1) = do
     eq env t0 t1
     let env' = Env (unvar (\n -> error (show (name n) ++ " undefined")) (fmap F . ctx env))
                    (unvar (Id . B) (fmap F . def env))
     eq env' (fromScope u0) (fromScope u1)
+  eq env (NCase t0 as0) (NCase t1 as1) = do
+    eq env t0 t1
+    let eqBranches [] [] = return ()
+        eqBranches ((l0,u0):lsu0) ((l1,u1):lsu1)
+          | l0 == l1 = eq env u0 u1 >> eqBranches lsu0 lsu1
+        eqBranches _ _ = throwError "eq: Case: branches differ"
+    eqBranches as0 as1
+  eq env (NForce t0) (NForce t1) = eq env t0 t1
+  eq env (NUnfold t0 u0) (NUnfold t1 u1) = do
+    eq env t0 t1
+    let env' = Env (unvar (\n -> error ("eq Neutral: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
+               (unvar (Id . B) (fmap F . def env))
+    eq env' (fromScope u0) (fromScope u1)
   eq _ _ _ = throwError "eq: Different Neutrals"
+
+instance Equal Boxed where
+  eq env (Boxed t0) (Boxed t1) = eqBox env t0 t1
+
+eqBox :: (MonadError String m, Eq a, Eq n, Show n, Show a)
+      => Env' n a
+      -> Term n a -> Term n a
+      -> m ()
+eqBox env (Var i0) (Var i1)
+  | i0 == i1  = return ()
+  | otherwise = do
+      let ei0 = def env i0
+          ei1 = def env i1
+      case (ei0,ei1) of
+        (Id j0, Id j1) -> unless (j0 == j1) (throwError "eqBox: Different variables")
+        (Cloj t0, Cloj t1) -> eq env t0 t1
+        _ -> throwError "eqBox: Variable vs Neutral"
+eqBox env (Let _ p t) c =
+  let inst = instantiateName es
+      es   = inst . defs p
+  in  eq env (inst t) c
+eqBox env c c'@(Let _ _ _) = eqBox env c' c
+eqBox env (Pi t0 u0) (Pi t1 u1) = do
+  eqBox env (extract t0) (extract t1)
+  let env' = extendEnvQ env (extract t0)
+  eq env' (Boxed (fromScope u0)) (Boxed (fromScope u1))
+eqBox env (Sigma t0 u0) (Sigma t1 u1) = do
+  eqBox env (extract t0) (extract t1)
+  let env' = extendEnvQ env (extract t0)
+  eq env' (Boxed (fromScope u0)) (Boxed (fromScope u1))
+eqBox env (Lam t0 u0) (Lam t1 u1) = do
+  v' <- runMaybeT $ do t0' <- MaybeT (return (extract t0))
+                       t1' <- MaybeT (return (extract t1))
+                       lift $ eq env t0' t1'
+                       return t0'
+  case v' of
+    Just v'' -> let env' = extendEnvQ env v'' in eq env' (fromScope u0) (fromScope u1)
+    _ -> throwError "eqBox: un-annotated Lambda"
+eqBox env (App t0 u0) (App t1 u1) = eqBox env t0 t1 >> eqBox env u0 u1
+eqBox env (Pair t0 u0) (Pair t1 u1) = eqBox env t0 t1 >> eqBox env u0 u1
+eqBox env (Split t0 _ s0) (Split t1 _ s1) = do
+  eqBox env t0 t1
+  let env' = Env (unvar (\n -> error ("eqBox Split: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
+                 (unvar (Id . B) (fmap F . def env))
+  eq env' (Boxed (fromScope s0)) (Boxed (fromScope s1))
+eqBox env (Case t0 as0) (Case t1 as1) =
+  eqBox env t0 t1 >>
+  zipWithM_ (\(l0,t0') (l1,t1') ->
+              if l0 == l1 then eqBox env t0' t1'
+                          else throwError "eqBox Case"
+            ) as0 as1
+eqBox env (Lift t0) (Lift t1) = eqBox env t0 t1
+eqBox env (Box t0) (Box t1) = eqBox env t0 t1
+eqBox env (Force t0) (Force t1) = eqBox env t0 t1
+eqBox env (Rec t0) (Rec t1) = eqBox env t0 t1
+eqBox env (Fold t0) (Fold t1) = eqBox env t0 t1
+eqBox env (Unfold t0 u0) (Unfold t1 u1) = do
+  eqBox env t0 t1
+  let env' = Env (unvar (\n -> error ("eqBox Unfold: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
+                 (unvar (Id . B) (fmap F . def env))
+  eq env' (Boxed (fromScope u0)) (Boxed (fromScope u1))
+eqBox _ t0 t1 | t0 == t1  = return () -- Type, Label, Enum
+              | otherwise = throwError "eqBox: Different terms"
 
 let_ :: Eq a => [(a,Type a a,Type a a)] -> Term a a -> Term a a
 let_ []   b = b
@@ -347,41 +533,82 @@ lam' v t e = Lam (Name v (Just t)) (abstract1Name v e)
 pi_ :: Eq a => (a,Type a a) -> Term a a -> Term a a
 pi_ (v,b) e = Pi (Name v b) (abstract1Name v e)
 
+sigma :: Eq a => (a,Type a a) -> Term a a -> Term a a
+sigma (v,b) e = Sigma (Name v b) (abstract1Name v e)
+
 app :: Term n a -> [Term n a] -> Term n a
 app f args = foldl App f args
 
 split :: Eq a => Term a a -> (a,a) -> Term a a -> Term a a
 split t (x,y) u = Split t (x,y) (abstractName (\z -> if z == x then Just Fst else if z == y then Just Snd else Nothing) u)
 
+(->-) :: Term String String -> Term String String -> Term String String
+(->-) t = pi_ ("",t)
+infixr 5 ->-
+
+(-*-) :: Term String String -> Term String String -> Term String String
+(-*-) t = sigma ("",t)
+infixr 4 -*-
+
 test :: Term String String
 test = let_ [("Eq"
-             ,pi_ ("a",Type) (pi_ ("",Var "a") (pi_ ("",Var "a") Type))
-             ,lam' "a" Type (lam' "x" (Var "a") (lam' "y" (Var "a") (pi_ ("P",pi_ ("",Var "a") Type) (pi_ ("",App (Var "P") (Var "x")) (App (Var "P") (Var "y")))))))
+             ,pi_ ("a",Type) (pi_ ("","a") (pi_ ("","a") Type))
+             ,lam' "a" Type (lam' "x" "a" (lam' "y" "a" (pi_ ("P",pi_ ("","a") Type) (pi_ ("",App "P" "x") (App "P" "y"))))))
             ,("refl"
-             ,pi_ ("a",Type) (pi_ ("x",Var "a") (app (Var "Eq") [Var "a",Var "x",Var "x"]))
-             ,lam' "a" Type (lam' "x" (Var "a") (lam' "P" (pi_ ("",Var "a") Type) (lam' "px" (App (Var "P") (Var "x")) (Var "px"))))
+             ,pi_ ("a",Type) (pi_ ("x","a") (app "Eq" ["a","x","x"]))
+             ,lam' "a" Type (lam' "x" "a" (lam' "P" (pi_ ("","a") Type) (lam' "px" (App "P" "x") "px")))
              )
             ,("A"
              ,Type
              ,Type
              )
             ,("a"
-             ,Var "a"
+             ,"a"
              ,Type
              )
             ,("b"
-             ,Var "A"
-             ,Var "a"
+             ,"A"
+             ,"a"
              )
             ,("t0"
-             ,app (Var "Eq") [Var "A",Var "a",Var "b"]
-             ,app (Var "refl") [Var "A",Var "a"]
+             ,app "Eq" ["A","a","b"]
+             ,app "refl" ["A","a"]
              )
             ]
        (Var "t0")
 
-unit :: Term String String
-unit = let_ [("Unit"
-             ,Type
-             ,Enum ["unit"])]
-       (Var "Unit")
+empty = [("Empty",Type,Enum [])]
+unit  = [("Unit",Type,Enum ["unit"])]
+bool  = empty ++ unit ++
+        [("Bool",Type,Enum ["true","false"])
+        ,("T"
+         ,"Bool" ->- Type
+         ,lam' "b" ("Bool")
+                  (Case (Var "b") [("true","Unit")
+                                  ,("false","Empty")])
+         )
+        ]
+nat   = bool ++
+        [("Nat"
+         ,Type
+         ,sigma ("l",Enum ["z","s"]) (Case "l" [("z","Unit")
+                                               ,("s",Rec (Box "Nat"))])
+         )
+        ,("zero"
+         ,"Nat"
+         ,Pair (Label "z") (Label "unit")
+         )
+        ,("succ"
+         ,"Nat" ->- "Nat"
+         ,lam' "n" "Nat" (Pair (Label "s") (Fold "n"))
+         )
+        ,("one"
+         ,"Nat"
+         ,App "succ" "zero"
+         )
+        ,("two"
+         ,"Nat"
+         ,App "succ" "one")
+        ]
+
+test1 = let_ nat "two"
