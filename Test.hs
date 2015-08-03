@@ -18,16 +18,15 @@ import Data.List
 import Data.String
 -- import Data.Functor.Invariant
 import Prelude.Extras
-
-import Debug.Trace
+import qualified Data.Set
 
 newtype Eval a = Eval { runEval :: (Except String a) }
   deriving (Functor, Applicative, Monad, MonadError String)
 
+doEval :: Show a => Eval a -> IO ()
 doEval t = case runExcept $ runEval t of
              Left s  -> putStrLn s
              Right a -> print a
-
 
 data Term n a
   = Var !a
@@ -142,11 +141,11 @@ data EnvEntry f a
 type EnvEntry' n = EnvEntry (Term n)
 type Env' n      = Env (Term n) (EnvEntry' n)
 
--- emptyEnv :: Env f g a
+emptyEnv :: Show a => Env f g a
 emptyEnv = Env (\x -> error ("No declaration for: " ++ show x))
                (\x -> error ("No definition for: " ++ show x))
 
-infer :: (Eq a, Eq n, Show n, Show a)
+infer :: (Eq a, Eq n, Ord n, Show n, Show a)
       => Env (Term n) (EnvEntry' n) a
       -> Term n a
       -> Eval (Type n a)
@@ -196,7 +195,7 @@ infer _ (Label _) = throwError "infer: cannot infer un-annotated Label"
 infer _ (Case _ _) = throwError "infer: cannot infer un-annotated Case"
 infer _ (Unfold _ _) = throwError "infer: cannot infer un-annotated Unfold"
 
-infer' :: (Eq a, Eq n, Show n, Show a)
+infer' :: (Eq a, Eq n, Ord n, Show n, Show a)
        => Env' n a
        -> Term n a
        -> Eval (Value n a)
@@ -266,7 +265,7 @@ extendEnvUnfold (Env ctxOld defOld) tyA tName tM = Env ctx' def'
       | Just tm'  == tM = Cloj (Fold (Var (B (Name tName ()))))
       | otherwise       = F <$> defOld tm'
 
-checkProg :: (Eq a, Eq n, Show n, Show a)
+checkProg :: (Eq a, Eq n, Ord n, Show n, Show a)
           => Env' n a -> Prog n a
           -> Eval (Env' n (Var (Name n Int) a))
 checkProg env p = do
@@ -274,7 +273,7 @@ checkProg env p = do
   mapM_ (checkProg' env' . bimap fromScope fromScope . extract) p
   return env'
 
-checkProg' :: (Eq a, Eq n, Show n, Show a)
+checkProg' :: (Eq a, Eq n, Ord n, Show n, Show a)
            => Env' n a
            -> (Type n a, Term n a)
            -> Eval ()
@@ -282,7 +281,7 @@ checkProg' env (ty,tm) = do
   check env ty Type
   check env tm ty
 
-check :: (Eq a, Eq n, Show n, Show a)
+check :: (Eq a, Eq n, Ord n, Show n, Show a)
       => Env' n a -> Term n a -> Term n a -> Eval ()
 check env (Let _ p s) c = do
   env' <- checkProg env p
@@ -298,15 +297,15 @@ check env (Split t (x,y) u) c = do
                    _ -> Nothing
           env' = extendEnvSplit env (extract tyA) tyB x y tM
       check env' (fromScope u) (F <$> c)
-    _ -> throwError "check: Split: expected sigma"
+    _ -> throwError ("check: Split: expected sigma: " ++ show sigmab)
 
 check env (Case t as) c = do
   enum <- infer' env t
   case enum of
     VEnum ls ->
       let ls' = map fst as
-      in  if ls /= ls'
-            then throwError "check: Labels don't match"
+      in  if (Data.Set.fromList ls) /= (Data.Set.fromList ls')
+            then throwError ("check: Labels don't match: " ++ show (ls,ls'))
             else do
               t' <- eval env t
               case t' of
@@ -314,7 +313,7 @@ check env (Case t as) c = do
                   mapM_ (\(l,u) -> let env' = extendEnvCase env i l
                                    in  check env' u c) as
                 _ -> mapM_ (\(_,u) -> check env u c) as
-    _ -> throwError "check: Case: expected Enum"
+    _ -> throwError ("check: Case: expected Enum: " ++ show enum)
 
 check env (Unfold t s) c = do
   vrec <- infer' env (extract t)
@@ -332,7 +331,7 @@ check env (Force t) c = check env t (Lift c)
 
 check env t a = check' env t =<< eval env a
 
-check' :: (Eq a, Eq n, Show n, Show a) => Env' n a -> Term n a -> Value n a -> Eval ()
+check' :: (Eq a, Eq n, Ord n, Show n, Show a) => Env' n a -> Term n a -> Value n a -> Eval ()
 check' env (Lam v s) (VPi ty s') = do
   maybe (return ()) (eq env (extract ty)) (extract v)
   let env' = extendEnvQ env (extract ty)
@@ -468,7 +467,7 @@ instance Equal Value where
 instance Equal Neutral where
   eq _ (NVar i0) (NVar i1)
     | i0 == i1  = return ()
-    | otherwise = throwError "eq: Different variables"
+    | otherwise = throwError ("eq: Different variables: " ++ show (i0,i1))
     -- | otherwise = do
     --     let ei0 = def env i0
     --         ei1 = def env i1
@@ -588,7 +587,10 @@ app f args = foldl App f args
 split :: Eq a => Term a a -> (a,a) -> Term a a -> Term a a
 split t (x,y) u = Split t (x,y) (abstractName (\z -> if z == x then Just Fst else if z == y then Just Snd else Nothing) u)
 
+unfold_ :: Eq a => Term a a -> a -> Term a a -> Term a a
 unfold_ t v u = Unfold (Name v t) (abstract1Name v u)
+
+unfold' :: (Eq a, IsString a) => Term a a -> Term a a
 unfold' t     = unfold_ t "x_unfold" "x_unfold"
 
 (->-) :: Term String String -> Term String String -> Term String String
@@ -626,8 +628,13 @@ test = let_ [("Eq"
             ]
        (Var "t0")
 
+empty :: [(String,Type String String,Term String String)]
 empty = [("Empty",Type,Enum [])]
+
+unit :: [(String,Type String String,Term String String)]
 unit  = [("Unit",Type,Enum ["unit"])]
+
+bool :: [(String,Type String String,Term String String)]
 bool  = empty ++ unit ++
         [("Bool",Type,Enum ["true","false"])
         ,("T"
@@ -637,6 +644,8 @@ bool  = empty ++ unit ++
                                   ,("false","Empty")])
          )
         ]
+
+nat :: [(String,Type String String,Term String String)]
 nat   = bool ++
         [("Nat"
          ,Type
@@ -676,7 +685,44 @@ nat   = bool ++
          )
         ]
 
-fin   = nat ++
+fin :: [(String,Type String String,Term String String)]
+fin = nat ++
+      [("Fin"
+       ,"Nat" ->- Type
+       ,lam' "n" "Nat" $ split "n" ("ln","n'") $ Force $
+          Case "ln" [("z",Box "Empty")
+                    ,("s",Box (sigma ("l",Enum ["z","s"]) $
+                        Case "l" [("z","Unit")
+                                 ,("s",App "Fin" (unfold' "n'"))]))
+                    ]
+       )
+      ]
+
+vec :: [(String,Type String String,Term String String)]
+vec = fin ++
+      [("Vec"
+       ,"Nat" ->- Type ->- Type
+       ,lam' "m" "Nat" $ lam' "a" Type $ split "m" ("lm","m'") $ Force $
+          Case "lm" [("z",Box "Unit")
+                    ,("s",Box ("a" -*- app "Vec" [unfold' "m'","a"]))
+                    ]
+       )
+      ,("nth"
+       ,pi_ ("a",Type) $ pi_ ("n","Nat") $ app "Vec" ["n","a"] ->- App "Fin" "n" ->- "a"
+       ,lam' "a" Type $ lam' "n" "Nat" $ lam' "xs" (app "Vec" ["n","a"]) $ lam' "i" (App "Fin" "n") $
+          split "n" ("ln","n'") $ Force $
+          Case "ln" [("z",Case "i" [])
+                    ,("s",split "xs" ("x","xs'") $ split "i" ("li","i'") $
+                        Case "li" [("z",Box "x")
+                                  ,("s",Box (app "nth" ["a",unfold' "n'", "xs'", "i'"]))
+                                  ]
+                      )
+                    ]
+       )
+      ]
+
+fin' :: [(String,Type String String,Term String String)]
+fin'   = nat ++
         [("Fin"
          ,"Nat" ->- Type
          ,lam' "n" "Nat" $ sigma ("l",Enum ["z","s"]) $
@@ -686,7 +732,8 @@ fin   = nat ++
          )
         ]
 
-vec   = fin ++
+vec' :: [(String,Type String String,Term String String)]
+vec'   = fin' ++
         [("Vec"
          ,"Nat" ->- Type ->- Type
          ,lam' "n" "Nat" $ lam' "A" Type $ sigma ("l",Enum ["nil","cons"]) $
@@ -694,15 +741,32 @@ vec   = fin ++
                      ,("cons",sigma ("n'","Nat") ("A" -*- Rec (Box (app "Vec" ["n'","A"])) -*- app "EqNat" [App "suc" "n'","n"]))
                      ]
          )
-        ,("nil"
-         ,pi_ ("A",Type) $ app "Vec" ["zero","A"]
-         ,lam' "A" Type $ Pair (Label "nil") (App "reflNat" "zero")
-         )
-        ,("cons"
-         ,pi_ ("n","Nat") $ pi_ ("A",Type) $ "A" ->- app "Vec" ["n","A"] ->- app "Vec" [App "suc" "n","A"]
-         ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
-            Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
-         )
+        -- ,("nil"
+        --  ,pi_ ("A",Type) $ app "Vec" ["zero","A"]
+        --  ,lam' "A" Type $ Pair (Label "nil") (App "reflNat" "zero")
+        --  )
+        -- ,("cons"
+        --  ,pi_ ("n","Nat") $ pi_ ("A",Type) $ "A" ->- app "Vec" ["n","A"] ->- app "Vec" [App "suc" "n","A"]
+        --  ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
+        --     Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
+        --  )
+        -- ,("lookup"
+        --  ,pi_ ("A",Type) $ pi_ ("n","Nat") $ (App "Fin" "n") ->- (app "Vec" ["n","A"]) ->- "A"
+        --  ,lam' "A" Type $ lam' "n" "Nat" $ lam' "i" (App "Fin" "n") $ lam' "xs" (app "Vec" ["n","A"]) $
+        --     split "i" ("li","i'") $
+        --       Case "li" [("z",split "i'" ("ln","n") $ split "xs" ("xc","xv") "xv")
+        --                 ,("s",undefined)
+        --                 ]
+        --  )
+          ,("tail"
+           ,pi_ ("n","Nat") $ pi_ ("a",Type) $ app "Vec" [App "suc" "n","a"] ->- app "Vec" ["n","a"]
+           ,lam' "n" "Nat" $ lam' "a" Type $ lam' "as" (app "Vec" [App "suc" "n","a"]) $
+            split "as" ("l","as'") $
+            Case "l" [("cons",split "as'" ("m","abs") $ split "abs" ("a'","bsn") $ split "bsn" ("bs","n'") $ unfold' "bs")
+                     ,("nil",undefined)
+                     ]
+           )
         ]
 
-test1 = let_ vec "cons"
+test1 :: Term String String
+test1 = let_ vec' "tail"
