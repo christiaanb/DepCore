@@ -683,6 +683,23 @@ nat   = bool ++
                              ,("s",Box (App "reflNat" (unfold' "n'")))
                              ])
          )
+        ,("substNat"
+         ,pi_ ("P","Nat" ->- Type) $ pi_ ("m","Nat") $ pi_ ("n","Nat") $
+          app "EqNat" ["m","n"] ->- App "P" "m" ->- App "P" "n"
+         ,lam' "P" ("Nat" ->- Type) $ lam' "m" "Nat" $ lam' "n" "Nat" $
+          lam' "q" (app "EqNat" ["m","n"]) $ lam' "x" (App "P" "m") $
+          split "m" ("lm","m'") $
+          split "n" ("ln","n'") $ Force $
+            Case "lm" [("z",Case "ln" [("z",Case "m'" [("unit",Case "n'" [("unit",Box "x")])])
+                                      ,("s",Case "q" [])
+                                      ])
+                      ,("s",Case "ln" [("z",Case "q" [])
+                                      ,("s",Box $
+                                            unfold_ "m'" "m'" $
+                                            unfold_ "n'" "n'" $
+                                            app "substNat" [lam' "i" "Nat" (App "P" (App "suc" "i"))
+                                                           ,"m'","n'","q","x"])])]
+         )
         ]
 
 fin :: [(String,Type String String,Term String String)]
@@ -741,15 +758,15 @@ vec'   = fin' ++
                      ,("cons",sigma ("n'","Nat") ("A" -*- Rec (Box (app "Vec" ["n'","A"])) -*- app "EqNat" [App "suc" "n'","n"]))
                      ]
          )
-        -- ,("nil"
-        --  ,pi_ ("A",Type) $ app "Vec" ["zero","A"]
-        --  ,lam' "A" Type $ Pair (Label "nil") (App "reflNat" "zero")
-        --  )
-        -- ,("cons"
-        --  ,pi_ ("n","Nat") $ pi_ ("A",Type) $ "A" ->- app "Vec" ["n","A"] ->- app "Vec" [App "suc" "n","A"]
-        --  ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
-        --     Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
-        --  )
+        ,("nil"
+         ,pi_ ("A",Type) $ app "Vec" ["zero","A"]
+         ,lam' "A" Type $ Pair (Label "nil") (App "reflNat" "zero")
+         )
+        ,("cons"
+         ,pi_ ("n","Nat") $ pi_ ("A",Type) $ "A" ->- app "Vec" ["n","A"] ->- app "Vec" [App "suc" "n","A"]
+         ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
+            Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
+         )
         -- ,("lookup"
         --  ,pi_ ("A",Type) $ pi_ ("n","Nat") $ (App "Fin" "n") ->- (app "Vec" ["n","A"]) ->- "A"
         --  ,lam' "A" Type $ lam' "n" "Nat" $ lam' "i" (App "Fin" "n") $ lam' "xs" (app "Vec" ["n","A"]) $
@@ -761,9 +778,16 @@ vec'   = fin' ++
           ,("tail"
            ,pi_ ("n","Nat") $ pi_ ("a",Type) $ app "Vec" [App "suc" "n","a"] ->- app "Vec" ["n","a"]
            ,lam' "n" "Nat" $ lam' "a" Type $ lam' "as" (app "Vec" [App "suc" "n","a"]) $
-            split "as" ("l","as'") $
-            Case "l" [("cons",split "as'" ("m","abs") $ split "abs" ("a'","bsn") $ split "bsn" ("bs","n'") $ unfold' "bs")
-                     ,("nil",undefined)
+            split "as" ("l","as'") $ Force $
+            Case "l" [("cons",split "as'" ("m","abs") $ split "abs" ("a'","bsn") $
+                       split "bsn" ("bs","n'") $
+                       Box (app "substNat" [lam' "x" "Nat" (app "Vec" ["x","a"])
+                                           ,"m"
+                                           ,"n"
+                                           ,"n'"
+                                           ,unfold' "bs"]
+                                           ))
+                     ,("nil",Case "as'" [])
                      ]
            )
         ]
