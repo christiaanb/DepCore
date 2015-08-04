@@ -795,17 +795,25 @@ vec'   = fin' ++
          ,lam' "A" Type $ lam' "n" "Nat" $ lam' "i" (App "Fin" "n") $ lam' "xs" (app "Vec" ["n","A"]) $
             split "i" ("li","i'") $ Force $
               Case "li" [("s",split "i'" ("fn","i''") $ split "i''" ("fr","feq") $
-                            split (app "substNat" [lam' "k" "Nat" (app "Vec" ["k","A"]),"n",App "suc" "fn",app "symNat" [App "suc" "fn","n","feq"],"xs"]) ("xc","xs'") $
+                            split "xs" ("xc","xs'") $
                               Case "xc" [("cons",split "xs'" ("xn","xs''") $ split "xs''" ("xa","xs3") $
                                                  split "xs3" ("xr","xseq") $ Box $
                                                  app "lookup" ["A","fn",(unfold' "fr"),
                                                     app "substNat" [lam' "k" "Nat" (app "Vec" ["k","A"])
-                                                                   ,"xn","fn","xseq"
+                                                                   ,"xn","fn"
+                                                                   ,app "transNat" [App "suc" "xn","n",App "suc" "fn"
+                                                                                   ,"xseq"
+                                                                                   ,app "symNat" [App "suc" "fn","n","feq"]
+                                                                                   ]
                                                                    ,unfold' "xr"]])
-                                        ,("nil",Case "xs'" [])])
-                        ,("z",split "i'" ("fn","feq") $ split (app "substNat" [lam' "k" "Nat" (app "Vec" ["k","A"]),"n",App "suc" "fn",app "symNat" [App "suc" "fn","n","feq"],"xs"]) ("xc","xs'") $
+                                        ,("nil",Case (app "substNat" [lam' "k" "Nat" (app "EqNat" ["zero","k"]),"n",App "suc" "fn"
+                                                                        ,app "symNat" [App "suc" "fn","n","feq"]
+                                                                        ,"xs'"]) [])])
+                        ,("z",split "i'" ("fn","feq") $ split "xs" ("xc","xs'") $
                                 Case "xc" [("cons",split "xs'" ("xn","xbs") $ split "xbs" ("xa","xb") $ Box "xa")
-                                          ,("nil" ,Case "xs'" [])
+                                          ,("nil" ,Case (app "substNat" [lam' "k" "Nat" (app "EqNat" ["zero","k"]),"n",App "suc" "fn"
+                                                                        ,app "symNat" [App "suc" "fn","n","feq"]
+                                                                        ,"xs'"]) [])
                                           ])
                         ]
          )
