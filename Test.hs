@@ -19,6 +19,7 @@ import Data.String
 -- import Data.Functor.Invariant
 import Prelude.Extras
 import qualified Data.Set
+import Debug.Trace
 
 newtype Eval a = Eval { runEval :: (Except String a) }
   deriving (Functor, Applicative, Monad, MonadError String)
@@ -47,6 +48,7 @@ data Term n a
   | Rec (Term n a)
   | Fold (Term n a)
   | Unfold (Name n (Term n a)) (Scope (Name n ()) (Term n) a)
+  | BeleiveMe
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 data Tup = Fst | Snd
@@ -89,6 +91,7 @@ bindTerm (Force t) f    = Force (bindTerm t f)
 bindTerm (Rec t) f      = Rec (bindTerm t f)
 bindTerm (Fold t) f     = Fold (bindTerm t f)
 bindTerm (Unfold t s) f = Unfold (fmap (`bindTerm` f) t) (s >>>= f)
+bindTerm BeleiveMe _    = BeleiveMe
 
 bindProg :: Prog n a -> (a -> Term n b) -> Prog n b
 bindProg ps f = map (fmap (bimap (>>>= f) (>>>= f))) ps
@@ -109,6 +112,7 @@ data Value n a
   | VBox   (Boxed n a)
   | VRec   (Type n a)
   | VFold  (Term n a)
+  | VBeleiveMe
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 newtype Boxed n a = Boxed { unBoxed :: Term n a }
@@ -194,6 +198,7 @@ infer _ (Split _ _ _) = throwError "infer: cannot infer un-annotated Split"
 infer _ (Label _) = throwError "infer: cannot infer un-annotated Label"
 infer _ (Case _ _) = throwError "infer: cannot infer un-annotated Case"
 infer _ (Unfold _ _) = throwError "infer: cannot infer un-annotated Unfold"
+infer _ BeleiveMe = throwError "infer: cannot infer un-annotated BeleiveMe"
 
 infer' :: (Eq a, Eq n, Ord n, Show n, Show a)
        => Env' n a
@@ -325,7 +330,7 @@ check env (Unfold t s) c = do
                  _ -> Nothing
           env' = extendEnvUnfold env a (name t) tM
       check env' (fromScope s) (F <$> c)
-    _ -> throwError "check: Unfold: expected Rec"
+    _ -> throwError ("check: Unfold: expected Rec: " ++ show vrec)
 
 check env (Force t) c = check env t (Lift c)
 
@@ -346,6 +351,7 @@ check' _ (Label l) (VEnum ls) | l `elem` ls = return ()
 check' _ (Label _) _ = throwError "check': Label"
 check' env (Box t) (VLift a) = check env t a
 check' env (Fold t) (VRec a) = check' env t =<< eval env (Force a)
+check' _ BeleiveMe v = trace ("BeleiveMe: " ++ show v) (return ()) -- throwError ("BeleiveMe: " ++ show v)
 check' env t a       = do b <- infer' env t
                           t' <- infer env t
                           catchError (eq env a b)
@@ -380,6 +386,7 @@ eval env (Force t)   = force env =<< eval env t
 eval _   (Rec t)     = return (VRec t)
 eval _   (Fold t)    = return (VFold t)
 eval env (Unfold t s) = flip (unfold env (name t)) s =<< eval env (extract t)
+eval _   BeleiveMe   = return VBeleiveMe
 
 evalApp :: (MonadError String m, Eq n)
         => Env' n a -> Value n a -> Term n a -> m (Value n a)
@@ -496,7 +503,7 @@ instance Equal Neutral where
     let env' = Env (unvar (\n -> error ("eq Neutral: " ++ show (name n) ++ " undefined")) (fmap F . ctx env))
                (unvar (Id . B) (fmap F . def env))
     eq env' (fromScope u0) (fromScope u1)
-  eq _ _ _ = throwError "eq: Different Neutrals"
+  eq _ n0 n1 = throwError ("eq: Different Neutrals: \nn0\n" ++ show n0 ++ "\nn1:\n" ++ show n1)
 
 instance Equal Boxed where
   eq env (Boxed t0) (Boxed t1) = eqBox env t0 t1
@@ -700,6 +707,22 @@ nat   = bool ++
                                             app "substNat" [lam' "i" "Nat" (App "P" (App "suc" "i"))
                                                            ,"m'","n'","q","x"])])]
          )
+        ,("symNat"
+         ,pi_ ("m","Nat") $ pi_ ("n","Nat") $ app "EqNat" ["m","n"] ->-
+          app "EqNat" ["n","m"]
+         ,lam' "m" "Nat" $ lam' "n" "Nat" $ lam' "p" (app "EqNat" ["m","n"]) $
+          app "substNat" [lam' "i" "Nat" $ app "EqNat" ["i","m"]
+                         ,"m","n","p",App "reflNat" "m"]
+         )
+        ,("transNat"
+         ,pi_ ("i","Nat") $ pi_ ("j","Nat") $ pi_ ("k","Nat") $
+          app "EqNat" ["i","j"] ->- app "EqNat" ["j","k"] ->- app "EqNat" ["i","k"]
+         ,lam' "i" "Nat" $ lam' "j" "Nat" $ lam' "k" "Nat" $
+          lam' "p" (app "EqNat" ["i","j"]) $ lam' "q" (app "EqNat" ["j","k"]) $
+          app "substNat" [lam' "x" "Nat" $ app "EqNat" ["i","x"]
+                         ,"j","k","q","p"
+                         ]
+         )
         ]
 
 fin :: [(String,Type String String,Term String String)]
@@ -767,14 +790,26 @@ vec'   = fin' ++
          ,lam' "n" "Nat" $ lam' "A" Type $ lam' "a" "A" $ lam' "v" (app "Vec" ["n","A"]) $
             Pair (Label "cons") (Pair "n" (Pair "a" (Pair (Fold "v") (App "reflNat" (App "suc" "n")))))
          )
-        -- ,("lookup"
-        --  ,pi_ ("A",Type) $ pi_ ("n","Nat") $ (App "Fin" "n") ->- (app "Vec" ["n","A"]) ->- "A"
-        --  ,lam' "A" Type $ lam' "n" "Nat" $ lam' "i" (App "Fin" "n") $ lam' "xs" (app "Vec" ["n","A"]) $
-        --     split "i" ("li","i'") $
-        --       Case "li" [("z",split "i'" ("ln","n") $ split "xs" ("xc","xv") "xv")
-        --                 ,("s",undefined)
-        --                 ]
-        --  )
+        ,("lookup"
+         ,pi_ ("A",Type) $ pi_ ("n","Nat") $ (App "Fin" "n") ->- (app "Vec" ["n","A"]) ->- "A"
+         ,lam' "A" Type $ lam' "n" "Nat" $ lam' "i" (App "Fin" "n") $ lam' "xs" (app "Vec" ["n","A"]) $
+            split "i" ("li","i'") $ split "xs" ("xc","xs'") $ Force $
+              Case "li" [("s",Case "xc" [("cons",split "i'" ("fn","i''") $ split "i''" ("fr","feq") $
+                                                 split "xs'" ("xn","xs''") $ split "xs''" ("xa","xs3") $
+                                                 split "xs3" ("xr","xseq") $ Box $
+                                                 app "lookup" ["A","fn",(unfold' "fr"),
+                                                    app "substNat" [lam' "k" "Nat" (app "Vec" ["k","A"])
+                                                                   ,"xn","fn"
+                                                                   ,app "transNat" [App "suc" "xn","n",App "suc" "fn"
+                                                                                   ,"xseq"
+                                                                                   ,app "symNat" [App "suc" "fn","n","feq"]]
+                                                                   ,unfold' "xr"]])
+                                        ,("nil",BeleiveMe)])
+                        ,("z",Case "xc" [("cons",split "xs'" ("xn","xbs") $ split "xbs" ("xa","xb") $ Box "xa")
+                                        ,("nil" ,BeleiveMe)
+                                        ])
+                        ]
+         )
           ,("tail"
            ,pi_ ("n","Nat") $ pi_ ("a",Type) $ app "Vec" [App "suc" "n","a"] ->- app "Vec" ["n","a"]
            ,lam' "n" "Nat" $ lam' "a" Type $ lam' "as" (app "Vec" [App "suc" "n","a"]) $
