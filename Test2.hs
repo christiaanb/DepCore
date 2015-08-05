@@ -8,7 +8,7 @@
 import Bound
 import Bound.Name
 -- import Bound.Scope
-import Bound.Var
+-- import Bound.Var
 import Control.Comonad
 import Control.Monad
 import Control.Monad.Except
@@ -44,7 +44,7 @@ data Term n a
   | Force !(Term n a)
   | Assume (Term n a, Term n a) (Term n a)
   | Require (Term n a) (Scope () (Term n) a, Scope () (Term n) a)
-  | BeleiveMe (Annotation (Term n a))
+  | BelieveMe (Annotation (Term n a))
   | Impossible (Annotation (Term n a))
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
@@ -99,7 +99,7 @@ bindTerm (Assume (l,r) t)      f = Assume (bindTerm l f,bindTerm r f)
                                           (bindTerm t f)
 bindTerm (Require t (l,r))     f = Require (bindTerm t f)
                                            (l >>>= f, r >>>= f)
-bindTerm (BeleiveMe an)        f = BeleiveMe (fmap (`bindTerm` f) an)
+bindTerm (BelieveMe an)        f = BelieveMe (fmap (`bindTerm` f) an)
 bindTerm (Impossible an)       f = Impossible (fmap (`bindTerm` f) an)
 
 bindProg :: Prog n a -> (a -> Term n b) -> Prog n b
@@ -184,6 +184,24 @@ tcTerm env (Let n prog body) an = do
   (abody,ty) <- tcTerm env' (fromScope body) (fmap (fmap F) an)
   return (Let n prog' (toScope abody),Let n prog' (toScope ty))
 
+tcTerm env (App t u) Nothing = do
+  (at,atty) <- inferType env t
+  eval env atty >>= \case
+    VQ (Pi _ tyA) tyB -> do
+      (au,_) <- checkType env u tyA
+      return (App at au,instantiate1Name au tyB)
+    _ -> throwError "tcTerm: expected pi"
+
+tcTerm env t@(Pair l r an1) an2 = do
+  ty <- matchAnnots env t an1 an2
+  eval env ty >>= \case
+    VQ (Sigma _ tyA) tyB -> do
+      (al,_) <- checkType env l tyA
+      let tyB' = instantiate1Name l tyB
+      (ar,_) <- checkType env r tyB'
+      return (Pair al ar (ann ty), ty)
+    _ -> throwError "tcTerm: expected sigma"
+
 -- tcTerm env tm (Just ty) = do
 --   (atm,ty') <- inferType env tm
 --   eq env ty' ty
@@ -261,7 +279,7 @@ data Value n a
   | VLabel n
   | VLift  (Type n a)
   | VBox   (Boxed n a)
-  | VBeleiveMe
+  | VBelieveMe
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 newtype Boxed n a = Boxed { unBoxed :: Term n a }
@@ -292,3 +310,16 @@ class Equal f where
 
 instance Equal Term where
   eq = undefined
+
+matchAnnots :: (Eq a, Eq n, Ord n, Show n, Show a)
+            => Env' n a -> Term n a -> Annotation (Term n a) -> Maybe (Type n a)
+            -> Eval (Type n a)
+matchAnnots _   e (Ann Nothing) Nothing   = throwError (show e ++ " requires annotation")
+matchAnnots _   _ (Ann Nothing) (Just ty) = return ty
+matchAnnots env _ (Ann (Just ty)) Nothing = do
+  aty <- tcType env ty
+  return aty
+matchAnnots env _ (Ann (Just ty1)) (Just ty2) = do
+  aty1 <- tcType env ty1
+  eq env aty1 ty2
+  return aty1
