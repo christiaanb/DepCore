@@ -17,7 +17,7 @@ import Data.Bifunctor
 import Data.List
 import Data.String
 import Prelude.Extras
--- import qualified Data.Set
+import qualified Data.Set
 -- import Debug.Trace
 
 newtype Eval a = Eval { runEval :: (Except String a) }
@@ -234,7 +234,21 @@ tcTerm env t@(Split p (x,y) body ann1) ann2 = do
       return (Split apr (x,y) (toScope abody) (ann ty),ty)
     _ -> throwError "tcTerm: split: expected sigma"
 
-tcTerm _ (Case _ _ _) _ = undefined
+tcTerm env t@(Case scrut alts ann1) ann2 = do
+  ty <- matchAnnots env t ann1 ann2
+  (ascrut,sty) <- inferType env scrut
+  enum <- eval env sty
+  case enum of
+    VEnum ls ->
+      let ls' = map fst alts
+      in  if (Data.Set.fromList ls) /= (Data.Set.fromList ls')
+             then throwError ("tcTerm: labels don't match: " ++ show (ls,ls'))
+             else do
+               alts' <- mapM (\(l,u) -> do let env' = extendEnvCase env ascrut l
+                                           (au,_) <-  checkType env' u ty
+                                           return (l,au)) alts
+               return (Case ascrut alts' (ann ty),ty)
+    _ -> throwError "tcTerm: case: expected enum"
 
 tcTerm env (Lift ty) Nothing = do
   aty <- tcType env ty
@@ -359,6 +373,12 @@ extendEnvSplit (Env ctxOld defOld cs) tyA tyB x y p =
 
     def' b@(B _) = Id b
     def' (F tm') = F <$> defOld tm'
+
+extendEnvCase :: Eq a
+              => Env' n a
+              -> Term n a -> n
+              -> Env' n a
+extendEnvCase env tm l = extendEnvConstraint env tm (Label l noAnn)
 
 data Value n a
   = Neutral (Neutral n a)
