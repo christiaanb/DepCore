@@ -7,14 +7,14 @@
 
 import Bound
 import Bound.Name
--- import Bound.Scope
+import Bound.Scope
 -- import Bound.Var
 import Control.Comonad
 import Control.Monad
 import Control.Monad.Except
 -- import Control.Monad.Trans.Maybe
 import Data.Bifunctor
--- import Data.List
+import Data.List
 import Data.String
 import Prelude.Extras
 -- import qualified Data.Set
@@ -42,8 +42,7 @@ data Term n a
   | Lift !(Term n a)
   | Box !(Term n a)
   | Force !(Term n a)
-  | Assume (Term n a, Term n a) (Term n a)
-  | Require (Term n a) (Scope () (Term n) a, Scope () (Term n) a)
+  | Require (Term n a) (Scope (Name n ()) (Term n) a, Scope (Name n ()) (Term n) a)
   | BelieveMe (Annotation (Term n a))
   | Impossible (Annotation (Term n a))
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
@@ -95,8 +94,6 @@ bindTerm (Case t alts an)      f = Case (bindTerm t f)
 bindTerm (Lift t)              f = Lift (bindTerm t f)
 bindTerm (Box t)               f = Box (bindTerm t f)
 bindTerm (Force t)             f = Force (bindTerm t f)
-bindTerm (Assume (l,r) t)      f = Assume (bindTerm l f,bindTerm r f)
-                                          (bindTerm t f)
 bindTerm (Require t (l,r))     f = Require (bindTerm t f)
                                            (l >>>= f, r >>>= f)
 bindTerm (BelieveMe an)        f = BelieveMe (fmap (`bindTerm` f) an)
@@ -112,7 +109,10 @@ data Env f g a
   = Env
   { ctx :: a -> f a
   , def :: a -> g a
+  , constraints :: Maybe [Constraint]
   }
+
+data Constraint = Constraint
 
 data EnvEntry f a
   = Cloj (f a)
@@ -125,6 +125,7 @@ type Env' n      = Env (Term n) (EnvEntry' n)
 emptyEnv :: Show a => Env f g a
 emptyEnv = Env (\x -> error ("No declaration for: " ++ show x))
                (\x -> error ("No definition for: " ++ show x))
+               (Just [])
 
 noAnn :: Annotation a
 noAnn = Ann Nothing
@@ -171,7 +172,15 @@ tcTerm env (Q (Lam n (Ann tmM)) s) Nothing = do
          ,Q (Pi n atyA) (toScope atyB)
          )
 
-tcTerm env t@(Q (Lam _ _) _) (Just x) = tcTerm' env t =<< eval env x
+tcTerm env (Q (Lam n (Ann ma)) body) (Just x) = eval env x >>= \case
+    VQ (Pi m tyA) tyB -> do
+      maybe (return ()) (eq env tyA) ma
+      let env' = extendEnvQ env tyA
+      (ebody,_) <- checkType env' (fromScope body) (fromScope tyB)
+      return (Q (Lam n (ann tyA)) (toScope ebody)
+             ,Q (Pi m tyA) tyB
+             )
+    ty' -> throwError ("check': expected pi: " ++ show (quote ty'))
 
 tcTerm env (Q (Sigma n tyA) tyB) Nothing = do
   atyA <- tcType env tyA
@@ -202,25 +211,81 @@ tcTerm env t@(Pair l r an1) an2 = do
       return (Pair al ar (ann ty), ty)
     _ -> throwError "tcTerm: expected sigma"
 
--- tcTerm env tm (Just ty) = do
---   (atm,ty') <- inferType env tm
---   eq env ty' ty
---   return (atm,ty)
+tcTerm _ t@(Enum ls) Nothing =
+  if nub ls /= ls
+     then throwError "tcTerm: duplicate labels"
+     else return (t,Type)
 
-tcTerm' :: (Eq a, Eq n, Ord n, Show n, Show a)
-        => Env' n a
-        -> Term n a
-        -> Value n a
-        -> Eval (Term n a,Type n a)
-tcTerm' env (Q (Lam n (Ann ma)) body) (VQ (Pi m tyA) tyB) = do
-  maybe (return ()) (eq env tyA) ma
-  let env' = extendEnvQ env tyA
-  (ebody,_) <- checkType env' (fromScope body) (fromScope tyB)
-  return (Q (Lam n (ann tyA)) (toScope ebody)
-         ,Q (Pi m tyA) tyB
-         )
+tcTerm env t@(Label l an1) an2 = do
+  ty <- matchAnnots env t an1 an2
+  eval env ty >>= \case
+    VEnum ls | l `elem` ls -> return (Label l (ann ty),Enum ls)
+             | otherwise   -> throwError "tcTerm: label not of enum"
+    _ -> throwError "tcTerm: expected enum"
 
-tcTerm' _ (Q (Lam _ _) _) ty = throwError ("check': expected pi: " ++ show (quote ty))
+tcTerm env t@(Split p (x,y) body ann1) ann2 = do
+  ty <- matchAnnots env t ann1 ann2
+  (apr,pty) <- inferType env p
+  sigmab <- eval env pty
+  case sigmab of
+    VQ (Sigma _ tyA) tyB -> do
+      let env' = extendEnvSplit env tyA tyB x y apr
+      (abody,_) <- checkType env' (fromScope body) (F <$> ty)
+      return (Split apr (x,y) (toScope abody) (ann ty),ty)
+    _ -> throwError "tcTerm: split: expected sigma"
+
+tcTerm _ (Case _ _ _) _ = undefined
+
+tcTerm env (Lift ty) Nothing = do
+  aty <- tcType env ty
+  return (Lift aty,Type)
+
+tcTerm env (Box t) Nothing = do
+  (at,aty) <- inferType env t
+  return (Box at, Lift aty)
+
+tcTerm env (Box t) (Just ty) = do
+  eval env ty >>= \case
+    VLift ty' -> do
+      (at,_) <- checkType env t ty'
+      return (Box at,Lift ty')
+    _ -> throwError "tcTerm: Box: expected lift"
+
+tcTerm env (Force t) Nothing = do
+  (at,aty) <- inferType env t
+  eval env aty >>= \case
+    VLift ty' -> return (Force at,ty')
+    _ -> throwError "tcTerm: Force: expected lift"
+
+tcTerm env (Force t) (Just ty) = checkType env t (Lift ty)
+
+tcTerm _ (Require ty (l,r)) Nothing = do
+  -- TODO: check context validity
+  -- |- Gamma,x:sigma,t==p
+  return (Require ty (l,r),Type)
+
+tcTerm env t@(BelieveMe ann1) ann2 = do
+  expectedTy <- matchAnnots env t ann1 ann2
+  return (BelieveMe (ann expectedTy), expectedTy)
+
+tcTerm env t@(Impossible ann1) ann2 = do
+  expectedTy <- matchAnnots env t ann1 ann2
+  case constraints env of
+    Nothing -> return (Impossible (ann expectedTy),expectedTy)
+    _ -> throwError "tcTerm: consistent context"
+
+tcTerm env tm (Just (Require ty (l,r))) = do
+  eq env (instantiate1Name tm l) (instantiate1Name tm r)
+  checkType env tm ty
+
+tcTerm env tm (Just ty) = do
+  (atm,ty') <- inferType env tm
+  case ty' of
+    Require ty'' (l,r) -> do
+      eq env (instantiate1Name tm l) (instantiate1Name tm r)
+      eq env ty'' ty
+    _ -> eq env ty' ty
+  return (atm,ty)
 
 tcType :: (Eq a, Eq n, Ord n, Show n, Show a)
        => Env' n a
@@ -251,7 +316,7 @@ checkProg' env (Name n (ty,tm)) = do
 extendEnvQ :: Env' n a
            -> Term n a
            -> Env' n (Var (Name n ()) a)
-extendEnvQ (Env ctxOld defOld) tm = Env ctx' def'
+extendEnvQ (Env ctxOld defOld cs) tm = Env ctx' def' cs
   where
     ctx' (B _)   = F <$> tm
     ctx' (F tm') = F <$> ctxOld tm'
@@ -262,13 +327,38 @@ extendEnvQ (Env ctxOld defOld) tm = Env ctx' def'
 extendEnvLet :: Env' n a
              -> Prog n a
              -> Env' n (Var (Name n Int) a)
-extendEnvLet (Env ctxOld defOld) ps = Env ctx' def'
+extendEnvLet (Env ctxOld defOld cs) ps = Env ctx' def' cs
   where
     ctx' (B x)  = fromScope . fst . extract . (ps!!) $ extract x
     ctx' (F tm) = F <$> ctxOld tm
 
     def' (B x)  = Cloj . fromScope . snd . extract . (ps!!) $ extract x
     def' (F tm) = F <$> defOld tm
+
+extendEnvConstraint :: Env' n a
+                    -> Term n a
+                    -> Term n a
+                    -> Env' n a
+extendEnvConstraint = undefined
+
+extendEnvSplit :: Eq a
+               => Env' n a
+               -> Type n a
+               -> Scope (Name n ()) (Type n) a
+               -> n -> n -> Term n a
+               -> Env' n (Var (Name n Tup) a)
+extendEnvSplit (Env ctxOld defOld cs) tyA tyB x y p =
+    extendEnvConstraint (Env ctx' def' cs)
+                        (F <$> p)
+                        (Pair (Var noAnn (B (Name x Fst)))
+                              (Var noAnn (B (Name y Snd))) noAnn)
+  where
+    ctx' (B (Name _ Fst)) = F <$> tyA
+    ctx' (B (Name _ Snd)) = fromScope (mapBound (const (Name x Fst)) tyB)
+    ctx' (F tm')  = F <$> ctxOld tm'
+
+    def' b@(B _) = Id b
+    def' (F tm') = F <$> defOld tm'
 
 data Value n a
   = Neutral (Neutral n a)
@@ -279,7 +369,9 @@ data Value n a
   | VLabel n
   | VLift  (Type n a)
   | VBox   (Boxed n a)
+  | VRequire (Term n a) (Scope (Name n ()) (Term n) a, Scope (Name n ()) (Term n) a)
   | VBelieveMe
+  | VImpossibe
   deriving (Eq,Ord,Show,Functor,Foldable,Traversable)
 
 newtype Boxed n a = Boxed { unBoxed :: Term n a }
@@ -299,7 +391,65 @@ instance Show n => Show1 (Value n)
 
 eval :: (MonadError String m, Eq n)
      => Env' n a -> Term n a -> m (Value n a)
-eval = undefined
+eval env (Var _ x)         = case def env x of
+                               Cloj tm -> eval env tm
+                               Id v    -> return (Neutral (NVar v))
+eval _   Type              = return VType
+eval _   (Q b s)           = return (VQ b s)
+eval env (Let _ p s)       = let inst = instantiateName es
+                                 es   = inst . defs p
+                             in  eval env (inst s)
+eval env (App t u)         = flip (evalApp env) u =<< eval env t
+eval _   (Pair l r _)      = return (VPair l r)
+eval env (Split t xy s _)  = flip (evalSplit env xy) s =<< eval env t
+eval _   (Enum ls)         = return (VEnum ls)
+eval _   (Label l _)       = return (VLabel l)
+eval env (Case t as _)     = flip (evalCase env) as =<< eval env t
+eval _   (Lift t)          = return (VLift t)
+eval _   (Box t)           = return (VBox (Boxed t))
+eval env (Force t)         = force env =<< eval env t
+eval _   (Require t (l,r)) = return (VRequire t (l,r))
+eval _   (BelieveMe _)     = return VBelieveMe
+eval _   (Impossible _)    = return VImpossibe
+
+evalApp :: (MonadError String m, Eq n)
+        => Env' n a -> Value n a -> Term n a -> m (Value n a)
+evalApp env (VQ (Lam _ _) s) u = eval env (instantiate1Name u s)
+evalApp _   (Neutral t) u      = return (Neutral (NApp t u))
+evalApp _   _ _                = throwError ("evalApp: function expected")
+
+evalSplit :: (MonadError String m, Eq n)
+          => Env' n a
+          -> (n,n)
+          -> Value n a
+          -> Scope (Name n Tup) (Term n) a
+          -> m (Value n a)
+evalSplit env _ (VPair l r) s = do
+  eval env (instantiateName (\case {Fst -> l;Snd -> r}) s)
+evalSplit _ xy (Neutral n) s = return (Neutral (NSplit n xy s))
+evalSplit _ _ _ _ = throwError "evalSplit: Pair expected"
+
+evalCase :: (MonadError String m, Eq n)
+         => Env' n a
+         -> Value n a
+         -> [(n,Term n a)]
+         -> m (Value n a)
+evalCase env (VLabel l) as = case lookup l as of
+  Just t  -> eval env t
+  Nothing -> throwError "evalCase: case not matched"
+evalCase _ (Neutral n) as = return (Neutral (NCase n as))
+evalCase _ _ _ = throwError "evalCase: Label expected"
+
+force :: (MonadError String m, Eq n)
+      => Env' n a
+      -> Value n a
+      -> m (Value n a)
+force env (VBox (Boxed c)) = eval env c
+force _   (Neutral n)      = return (Neutral (NForce n))
+force _   _                = throwError "force: Box expected"
+
+defs :: Prog n a -> Int -> Scope (Name n Int) (Term n) a
+defs ps i = snd . extract $ (ps!!i)
 
 quote :: Value n a -> Term n a
 quote = undefined
