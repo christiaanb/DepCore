@@ -475,13 +475,6 @@ instance Equal Neutral where
   eq _ (NVar i0) (NVar i1)
     | i0 == i1  = return ()
     | otherwise = throwError ("eq: Different variables: " ++ show (i0,i1))
-    -- | otherwise = do
-    --     let ei0 = def env i0
-    --         ei1 = def env i1
-    --     case (ei0,ei1) of
-    --       (Id j0, Id j1) -> unless (j0 == j1) (throwError "eq: Different variables")
-    --       (Cloj t0, Cloj t1) -> eq env t0 t1
-    --       _ -> throwError "eq: Variable vs Neutral"
   eq env (NApp t0 u0) (NApp t1 u1) =
     eq env t0 t1 >>
     eq env u0 u1
